@@ -1,79 +1,189 @@
-// ----- Upload flow -----
-const upInput = document.getElementById('uploadInput');
-const upBtn = document.getElementById('uploadBtn');
-const upRes = document.getElementById('uploadResult');
-const preview = document.getElementById('preview');
-
-upBtn.onclick = async () => {
-  const f = upInput.files?.[0];
-  if (!f) { upRes.textContent = 'Pick an image first.'; return; }
-  preview.src = URL.createObjectURL(f);
-  const fd = new FormData();
-  fd.append('image', f);
-  upRes.textContent = 'Predicting...';
-  const r = await fetch('/predict', { method: 'POST', body: fd });
-  const j = await r.json();
-  if (j.error) { upRes.textContent = 'Error: ' + j.error; return; }
-  upRes.textContent = `Prediction: ${j.label} (${(j.confidence*100).toFixed(1)}%)`;
-};
-
-// ----- Webcam flow -----
 const video = document.getElementById('video');
-const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const resultBox = document.getElementById('liveResult');
 const startBtn = document.getElementById('startBtn');
-const stopBtn  = document.getElementById('stopBtn');
-const liveRes  = document.getElementById('liveResult');
+const stopBtn = document.getElementById('stopBtn');
+const cameraSelect = document.getElementById('cameraSelect');
+const throttleChk = document.getElementById('throttleChk');
 
 let stream = null;
-let running = false;
 let sending = false;
+let rafId = null;
+let lastSent = 0;
+let targetIntervalMs = 200; // ~5 FPS
 
-startBtn.onclick = async () => {
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }});
-    video.srcObject = stream;
-    running = true;
-    liveRes.textContent = 'Running...';
-    loopSend();
-  } catch (e) {
-    liveRes.textContent = 'Camera error: ' + e.message;
-  }
-};
+async function listCameras() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter(d => d.kind === 'videoinput');
+  cameraSelect.innerHTML = '';
+  cams.forEach((d, i) => {
+    const opt = document.createElement('option');
+    opt.value = d.deviceId;
+    opt.text = d.label || `Camera ${i+1}`;
+    cameraSelect.appendChild(opt);
+  });
+}
 
-stopBtn.onclick = () => {
-  running = false;
+async function startCamera(deviceId) {
+  stopCamera();
+  const constraints = {
+    audio: false,
+    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }
+  };
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = stream;
+  await video.play();
+
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+
+  startSending();
+}
+
+function stopCamera() {
+  stopSending();
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
-  liveRes.textContent = 'Stopped.';
-};
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+}
 
-async function loopSend() {
-  if (!running) return;
-  if (sending) { requestAnimationFrame(loopSend); return; } // throttle
+function drawBox(x, y, w, h, label, conf) {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.strokeStyle = '#00FF00';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, w, h);
 
-  // draw current video frame to canvas
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+  const text = `${label} (${Math.round(conf*100)}%)`;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(x, Math.max(y-24, 0), ctx.measureText(text).width + 10, 22);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = '16px sans-serif';
+  ctx.fillText(text, x+5, Math.max(y-8, 16));
+}
+
+async function sendFrameLoop() {
+  if (!stream || !video.videoWidth) {
+    rafId = requestAnimationFrame(sendFrameLoop);
+    return;
+  }
+
+  const now = performance.now();
+  const throttle = throttleChk.checked;
+  if (sending || (throttle && now - lastSent < targetIntervalMs)) {
+    rafId = requestAnimationFrame(sendFrameLoop);
+    return;
+  }
 
   sending = true;
+  lastSent = now;
+
+  // Draw current video into a temp canvas, then to data URL
+  const tmp = document.createElement('canvas');
+  tmp.width = video.videoWidth;
+  tmp.height = video.videoHeight;
+  tmp.getContext('2d').drawImage(video, 0, 0, tmp.width, tmp.height);
+  const dataUrl = tmp.toDataURL('image/jpeg', 0.6); // compress to reduce bandwidth
+
   try {
-    const r = await fetch('/predict-frame', {
+    const res = await fetch('/predict_frame', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ frame: dataUrl })
+      body: JSON.stringify({ image: dataUrl })
     });
-    const j = await r.json();
-    if (!j.error) {
-      liveRes.textContent = `Prediction: ${j.label} (${(j.confidence*100).toFixed(1)}%)`;
+    const out = await res.json();
+
+    if (!out.ok) {
+      resultBox.textContent = `Server error: ${out.error || 'Unknown'}`;
+    } else if (out.status === 'no_face') {
+      resultBox.textContent = `No face detected`;
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    } else {
+      const { label, confidence, latency_ms, box } = out;
+      resultBox.textContent = `Prediction: ${label} • Confidence: ${Math.round(confidence*100)}% • Latency: ${latency_ms} ms`;
+      if (box) {
+        const [x,y,w,h] = box;
+        drawBox(x,y,w,h,label,confidence);
+      } else {
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+      }
     }
   } catch (e) {
-    liveRes.textContent = 'Network error';
+    resultBox.textContent = `Network error`;
   } finally {
     sending = false;
-    // send roughly ~6–10 fps to keep server light
-    setTimeout(() => requestAnimationFrame(loopSend), 120);
+    rafId = requestAnimationFrame(sendFrameLoop);
   }
 }
+
+function startSending() {
+  if (!rafId) rafId = requestAnimationFrame(sendFrameLoop);
+}
+function stopSending() {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  sending = false;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopSending(); else startSending();
+});
+
+startBtn.addEventListener('click', async () => {
+  try {
+    await listCameras();
+    await startCamera(cameraSelect.value || undefined);
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  } catch (e) {
+    alert('Camera error: ' + e.message);
+  }
+});
+
+stopBtn.addEventListener('click', () => {
+  stopCamera();
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+});
+
+// Upload form
+const uploadForm = document.getElementById('uploadForm');
+const uploadResult = document.getElementById('uploadResult');
+const uploadedPreview = document.getElementById('uploadedPreview');
+
+uploadForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const data = new FormData(uploadForm);
+  uploadResult.textContent = 'Predicting...';
+  uploadedPreview.style.display = 'none';
+
+  const file = uploadForm.querySelector('input[type=file]').files[0];
+  if (file) {
+    uploadedPreview.src = URL.createObjectURL(file);
+    uploadedPreview.style.display = 'block';
+  }
+
+  try {
+    const res = await fetch('/predict_image', { method: 'POST', body: data });
+    const out = await res.json();
+
+    if (!out.ok) {
+      uploadResult.textContent = `Server error: ${out.error || 'Unknown'}`;
+      return;
+    }
+    if (out.status === 'no_face') {
+      uploadResult.textContent = 'No face detected';
+      return;
+    }
+    uploadResult.textContent = `Prediction: ${out.label} • Confidence: ${Math.round(out.confidence*100)}% • Latency: ${out.latency_ms} ms`;
+  } catch (err) {
+    uploadResult.textContent = 'Network error';
+  }
+});
+
+// Populate camera list at load (requires prior permission on some browsers)
+navigator.mediaDevices?.getUserMedia({ video: true, audio: false })
+  .then(() => listCameras())
+  .catch(() => listCameras());
