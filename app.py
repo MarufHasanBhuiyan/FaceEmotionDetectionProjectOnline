@@ -1,91 +1,141 @@
-import os
-import base64
 import io
-import cv2
+import time
+import base64
 import numpy as np
+from flask import Flask, render_template, request, jsonify
+from PIL import Image
+import cv2
 import tensorflow as tf
-from flask import Flask, request, jsonify, render_template
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array
+
+# --------------------- Config ---------------------
+# Labels in the exact order your model outputs (8 classes)
+LABELS = ['angry','disgust','fear','happy','neutral','sad','surprise','depression']
+
+# Haarcascade for face detection
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Load model once at startup
+# If your model was saved with model.save('emotiondetector.h5')
+# this will restore the full model (architecture + weights).
+MODEL = load_model('emotiondetector.h5')
+
+# Warmup a dummy call (optional, improves first request latency)
+_ = MODEL.predict(np.zeros((1,48,48,1), dtype=np.float32))
 
 app = Flask(__name__)
 
-# Load model once
-MODEL_PATH = "emotiondetector.h5"
-model = tf.keras.models.load_model(MODEL_PATH)
+# --------------------- Helpers ---------------------
+def preprocess_face(gray_image, box):
+    x,y,w,h = box
+    face = gray_image[y:y+h, x:x+w]
+    # Guard against empty slices
+    if face.size == 0:
+        return None
+    face = cv2.resize(face, (48,48), interpolation=cv2.INTER_AREA)
+    face = face.astype("float32") / 255.0
+    face = np.expand_dims(img_to_array(face), axis=0)  # (1,48,48,1)
+    return face
 
-# Put your label order here (match your training order)
-EMOTION_LABELS = ['angry','depression','disgust','fear','happy','neutral','sad','surprise'][:model.output_shape[-1]]
+def decode_data_url_image(data_url):
+    # data_url: "data:image/jpeg;base64,......"
+    header, b64data = data_url.split(',', 1)
+    img_bytes = base64.b64decode(b64data)
+    pil_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    # Convert to OpenCV BGR
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-# Haar cascade for face detection (fallback to full image if none)
-FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+def pick_largest_face(faces):
+    if len(faces) == 0:
+        return None
+    # faces: array of (x,y,w,h). Pick by area
+    areas = [(w*h, (x,y,w,h)) for (x,y,w,h) in faces]
+    areas.sort(reverse=True, key=lambda t: t[0])
+    return areas[0][1]
 
-def _decode_image_from_bytes(image_bytes: bytes) -> np.ndarray:
-    arr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # BGR
-    return img
-
-def _decode_image_from_base64(data_url: str) -> np.ndarray:
-    # data:image/png;base64,AAAA...
-    b64 = data_url.split(',', 1)[1] if ',' in data_url else data_url
-    image_bytes = base64.b64decode(b64)
-    return _decode_image_from_bytes(image_bytes)
-
-def detect_and_preprocess(bgr_img: np.ndarray):
-    """Return (input_tensor, bbox or None) for the biggest detected face or full image fallback."""
-    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60,60))
-    roi = None
-    bbox = None
-
-    if len(faces) > 0:
-        # choose the largest face
-        x,y,w,h = max(faces, key=lambda f: f[2]*f[3])
-        roi = gray[y:y+h, x:x+w]
-        bbox = [int(x), int(y), int(w), int(h)]
-    else:
-        # fallback: use full grayscale frame
-        roi = gray
-
-    roi = cv2.resize(roi, (48,48), interpolation=cv2.INTER_AREA)
-    roi = roi.astype("float32") / 255.0
-    roi = np.expand_dims(roi, axis=(0, -1))  # (1,48,48,1)
-    return roi, bbox
-
-def predict_from_bgr(bgr_img: np.ndarray):
-    x, box = detect_and_preprocess(bgr_img)
-    preds = model.predict(x, verbose=0)[0]
-    idx = int(np.argmax(preds))
-    return {
-        "label": EMOTION_LABELS[idx] if idx < len(EMOTION_LABELS) else str(idx),
-        "confidence": float(preds[idx]),
-        "bbox": box
-    }
-
-@app.route("/")
+# --------------------- Routes ---------------------
+@app.route('/')
 def home():
-    return render_template("index.html")
+    return render_template('index.html')
 
-@app.route("/predict", methods=["POST"])
-def predict_upload():
-    file = request.files.get("image")
-    if not file:
-        return jsonify({"error":"no file"}), 400
-    bgr = _decode_image_from_bytes(file.read())
-    if bgr is None:
-        return jsonify({"error":"decode_failed"}), 400
-    result = predict_from_bgr(bgr)
-    return jsonify(result)
+@app.route('/predict_image', methods=['POST'])
+def predict_image():
+    """Handles file upload (image)"""
+    if 'file' not in request.files:
+        return jsonify({'ok': False, 'error': 'No file'}), 400
 
-@app.route("/predict-frame", methods=["POST"])
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'ok': False, 'error': 'Empty filename'}), 400
+
+    # Read image
+    img = Image.open(file.stream).convert('RGB')
+    frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+    # Detect faces on grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+
+    if len(faces) == 0:
+        return jsonify({'ok': True, 'status': 'no_face'})
+
+    box = pick_largest_face(faces)
+    inp = preprocess_face(gray, box)
+    if inp is None:
+        return jsonify({'ok': True, 'status': 'no_face'})
+
+    t0 = time.time()
+    preds = MODEL.predict(inp, verbose=0)[0]
+    latency_ms = int((time.time() - t0)*1000)
+    idx = int(np.argmax(preds))
+    conf = float(preds[idx])
+
+    x,y,w,h = map(int, box)
+    return jsonify({
+        'ok': True,
+        'status': 'ok',
+        'label': LABELS[idx],
+        'confidence': round(conf, 4),
+        'latency_ms': latency_ms,
+        'box': [x,y,w,h]
+    })
+
+@app.route('/predict_frame', methods=['POST'])
 def predict_frame():
-    data_url = request.json.get("frame")
-    if not data_url:
-        return jsonify({"error":"no_frame"}), 400
-    bgr = _decode_image_from_base64(data_url)
-    if bgr is None:
-        return jsonify({"error":"decode_failed"}), 400
-    result = predict_from_bgr(bgr)
-    return jsonify(result)
+    """Handles base64-encoded frame from webcam"""
+    data = request.get_json()
+    if not data or 'image' not in data:
+        return jsonify({'ok': False, 'error': 'Missing image'}), 400
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    frame = decode_data_url_image(data['image'])
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+
+    if len(faces) == 0:
+        return jsonify({'ok': True, 'status': 'no_face'})
+
+    box = pick_largest_face(faces)
+    inp = preprocess_face(gray, box)
+    if inp is None:
+        return jsonify({'ok': True, 'status': 'no_face'})
+
+    t0 = time.time()
+    preds = MODEL.predict(inp, verbose=0)[0]
+    latency_ms = int((time.time() - t0)*1000)
+    idx = int(np.argmax(preds))
+    conf = float(preds[idx])
+    x,y,w,h = map(int, box)
+
+    return jsonify({
+        'ok': True,
+        'status': 'ok',
+        'label': LABELS[idx],
+        'confidence': round(conf, 4),
+        'latency_ms': latency_ms,
+        'box': [x,y,w,h]
+    })
+
+if __name__ == '__main__':
+    # Local run (Render will use Gunicorn)
+    app.run(host='0.0.0.0', port=5000)
