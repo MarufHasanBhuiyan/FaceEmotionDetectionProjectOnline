@@ -14,22 +14,29 @@ let lastSent = 0;
 let targetIntervalMs = 200; // ~5 FPS
 
 async function listCameras() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  const cams = devices.filter(d => d.kind === 'videoinput');
-  cameraSelect.innerHTML = '';
-  cams.forEach((d, i) => {
-    const opt = document.createElement('option');
-    opt.value = d.deviceId;
-    opt.text = d.label || `Camera ${i+1}`;
-    cameraSelect.appendChild(opt);
-  });
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    cameraSelect.innerHTML = '';
+    cams.forEach((d, i) => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.text = d.label || `Camera ${i + 1}`;
+      cameraSelect.appendChild(opt);
+    });
+  } catch (e) {
+    console.error("Error listing cameras:", e);
+  }
 }
 
+// Start camera with proper facingMode for mobile
 async function startCamera(deviceId) {
   stopCamera();
   const constraints = {
     audio: false,
-    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' }
+    video: deviceId 
+      ? { deviceId: { exact: deviceId } } 
+      : { facingMode: { ideal: "user" } } // default front
   };
   stream = await navigator.mediaDevices.getUserMedia(constraints);
   video.srcObject = stream;
@@ -56,12 +63,12 @@ function drawBox(x, y, w, h, label, conf) {
   ctx.lineWidth = 2;
   ctx.strokeRect(x, y, w, h);
 
-  const text = `${label} (${Math.round(conf*100)}%)`;
+  const text = `${label} (${Math.round(conf * 100)}%)`;
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(x, Math.max(y-24, 0), ctx.measureText(text).width + 10, 22);
+  ctx.fillRect(x, Math.max(y - 24, 0), ctx.measureText(text).width + 10, 22);
   ctx.fillStyle = '#FFFFFF';
   ctx.font = '16px sans-serif';
-  ctx.fillText(text, x+5, Math.max(y-8, 16));
+  ctx.fillText(text, x + 5, Math.max(y - 8, 16));
 }
 
 async function sendFrameLoop() {
@@ -80,12 +87,11 @@ async function sendFrameLoop() {
   sending = true;
   lastSent = now;
 
-  // Draw current video into a temp canvas, then to data URL
   const tmp = document.createElement('canvas');
   tmp.width = video.videoWidth;
   tmp.height = video.videoHeight;
   tmp.getContext('2d').drawImage(video, 0, 0, tmp.width, tmp.height);
-  const dataUrl = tmp.toDataURL('image/jpeg', 0.6); // compress to reduce bandwidth
+  const dataUrl = tmp.toDataURL('image/jpeg', 0.6);
 
   try {
     const res = await fetch('/predict_frame', {
@@ -102,10 +108,10 @@ async function sendFrameLoop() {
       ctx.clearRect(0, 0, overlay.width, overlay.height);
     } else {
       const { label, confidence, latency_ms, box } = out;
-      resultBox.textContent = `Prediction: ${label} • Confidence: ${Math.round(confidence*100)}% • Latency: ${latency_ms} ms`;
+      resultBox.textContent = `Prediction: ${label} • Confidence: ${Math.round(confidence * 100)}% • Latency: ${latency_ms} ms`;
       if (box) {
-        const [x,y,w,h] = box;
-        drawBox(x,y,w,h,label,confidence);
+        const [x, y, w, h] = box;
+        drawBox(x, y, w, h, label, confidence);
       } else {
         ctx.clearRect(0, 0, overlay.width, overlay.height);
       }
@@ -118,14 +124,8 @@ async function sendFrameLoop() {
   }
 }
 
-function startSending() {
-  if (!rafId) rafId = requestAnimationFrame(sendFrameLoop);
-}
-function stopSending() {
-  if (rafId) cancelAnimationFrame(rafId);
-  rafId = null;
-  sending = false;
-}
+function startSending() { if (!rafId) rafId = requestAnimationFrame(sendFrameLoop); }
+function stopSending() { if (rafId) cancelAnimationFrame(rafId); rafId = null; sending = false; }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopSending(); else startSending();
@@ -134,7 +134,8 @@ document.addEventListener('visibilitychange', () => {
 startBtn.addEventListener('click', async () => {
   try {
     await listCameras();
-    await startCamera(cameraSelect.value || undefined);
+    const selectedDeviceId = cameraSelect.value || undefined;
+    await startCamera(selectedDeviceId);
     startBtn.disabled = true;
     stopBtn.disabled = false;
   } catch (e) {
@@ -183,7 +184,7 @@ uploadForm.addEventListener('submit', async (e) => {
   }
 });
 
-// Populate camera list at load (requires prior permission on some browsers)
+// Populate camera list at load
 navigator.mediaDevices?.getUserMedia({ video: true, audio: false })
   .then(() => listCameras())
   .catch(() => listCameras());
