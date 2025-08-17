@@ -1,3 +1,4 @@
+// ----- DOM -----
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
@@ -7,76 +8,49 @@ const stopBtn = document.getElementById('stopBtn');
 const cameraSelect = document.getElementById('cameraSelect');
 const throttleChk = document.getElementById('throttleChk');
 
+// ----- State / tuning -----
 let stream = null;
 let sending = false;
 let rafId = null;
 let lastSent = 0;
-let targetIntervalMs = 200; // ~5 FPS
-let populatedOnce = false;
 
-// ---------- Cameras ----------
-async function primePermissions() {
-  // Ask once so labels become available (esp. iOS).
-  try {
-    const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-    tmp.getTracks().forEach(t => t.stop());
-  } catch (_) { /* ignore */ }
-}
+// ~5 FPS when throttling is on
+const TARGET_INTERVAL_MS = 200;
 
-async function listCameras(preserveSelection = true) {
+// Send smaller frames to the server to cut latency/bandwidth
+const CAPTURE_WIDTH = 320;
+const CAPTURE_HEIGHT = 240;
+
+// Ignore very tiny face boxes (likely false positives from Haar)
+const MIN_BOX_AREA_RATIO = 0.01; // 1% of frame
+
+// Offscreen canvas reused for capture (no re-alloc each frame)
+const tmp = document.createElement('canvas');
+tmp.width = CAPTURE_WIDTH;
+tmp.height = CAPTURE_HEIGHT;
+const tctx = tmp.getContext('2d', { willReadFrequently: true });
+
+// ----- Utils -----
+async function listCameras() {
   try {
-    const prev = cameraSelect.value;
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cams = devices.filter(d => d.kind === 'videoinput');
-
     cameraSelect.innerHTML = '';
     cams.forEach((d, i) => {
       const opt = document.createElement('option');
-      opt.value = d.deviceId || '';
-      const label = d.label || `Camera ${i + 1}`;
-      opt.text = label;
-      // Useful hint for facing mode:
-      opt.dataset.facing =
-        /back|rear|environment/i.test(label) ? 'environment' :
-        /front|user|face/i.test(label) ? 'user' : '';
+      opt.value = d.deviceId;
+      opt.text = d.label || `Camera ${i + 1}`;
       cameraSelect.appendChild(opt);
     });
-
-    if (preserveSelection && [...cameraSelect.options].some(o => o.value === prev)) {
-      cameraSelect.value = prev;
-    } else {
-      // Prefer a rear camera by default on phones
-      const rear = [...cameraSelect.options].find(o => o.dataset.facing === 'environment');
-      if (rear) cameraSelect.value = rear.value;
-    }
-    populatedOnce = true;
   } catch (e) {
     console.error('Error listing cameras:', e);
   }
 }
 
-async function startCamera(deviceId) {
-  stopCamera();
-
-  const facingHint =
-    cameraSelect.selectedOptions[0]?.dataset?.facing || undefined;
-
-  // Build constraints: prefer exact deviceId, but also provide facingMode hint.
-  const constraints = {
-    audio: false,
-    video: deviceId
-      ? { deviceId: { exact: deviceId }, facingMode: facingHint ? { ideal: facingHint } : undefined }
-      : { facingMode: { ideal: facingHint || 'user' } }
-  };
-
-  stream = await navigator.mediaDevices.getUserMedia(constraints);
-  video.srcObject = stream;
-  await video.play();
-
-  overlay.width = video.videoWidth;
-  overlay.height = video.videoHeight;
-
-  startSending();
+function stopSending() {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  sending = false;
 }
 
 function stopCamera() {
@@ -88,29 +62,76 @@ function stopCamera() {
   ctx.clearRect(0, 0, overlay.width, overlay.height);
 }
 
-// Refresh camera list if devices change (USB cam plug/unplug, mobile rotate, etc.)
-navigator.mediaDevices?.addEventListener?.('devicechange', () => {
-  listCameras(true);
-});
+function setOverlayToVideo() {
+  // Size overlay to match the *displayed* video
+  overlay.width = video.videoWidth || CAPTURE_WIDTH;
+  overlay.height = video.videoHeight || CAPTURE_HEIGHT;
+}
 
-// ---------- Drawing ----------
-function drawBox(x, y, w, h, label, conf) {
+async function startCamera(deviceId) {
+  stopCamera();
+
+  const constraints = {
+    audio: false,
+    video: deviceId
+      ? {
+          deviceId: { exact: deviceId },
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 480, max: 480 }
+        }
+      : {
+          facingMode: { ideal: 'user' }, // default to front if none selected
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 480, max: 480 }
+        }
+  };
+
+  // Open the camera
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = stream;
+
+  // Wait for actual dimensions
+  await video.play();
+  if (!video.videoWidth) {
+    await new Promise(res => video.addEventListener('loadedmetadata', res, { once: true }));
+  }
+
+  setOverlayToVideo();
+  startSending();
+}
+
+function startSending() {
+  if (!rafId) rafId = requestAnimationFrame(sendFrameLoop);
+}
+
+function drawBoxScaled(box, label, conf) {
+  const [x, y, w, h] = box;
+
+  // The server saw CAPTURE_WIDTH x CAPTURE_HEIGHT.
+  // Scale to overlay/video size for correct drawing.
+  const sx = overlay.width / CAPTURE_WIDTH;
+  const sy = overlay.height / CAPTURE_HEIGHT;
+  const X = Math.round(x * sx);
+  const Y = Math.round(y * sy);
+  const W = Math.round(w * sx);
+  const H = Math.round(h * sy);
+
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   ctx.strokeStyle = '#00FF00';
   ctx.lineWidth = 2;
-  ctx.strokeRect(x, y, w, h);
+  ctx.strokeRect(X, Y, W, H);
 
   const text = `${label} (${Math.round(conf * 100)}%)`;
   ctx.font = '16px sans-serif';
   const tw = ctx.measureText(text).width + 10;
+  const th = 22;
 
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
-  ctx.fillRect(x, Math.max(y - 24, 0), tw, 22);
+  ctx.fillRect(X, Math.max(Y - th, 0), tw, th);
   ctx.fillStyle = '#FFFFFF';
-  ctx.fillText(text, x + 5, Math.max(y - 8, 16));
+  ctx.fillText(text, X + 5, Math.max(Y - 6, 16));
 }
 
-// ---------- Loop ----------
 async function sendFrameLoop() {
   if (!stream || !video.videoWidth) {
     rafId = requestAnimationFrame(sendFrameLoop);
@@ -118,19 +139,17 @@ async function sendFrameLoop() {
   }
 
   const now = performance.now();
-  if (sending || (throttleChk.checked && now - lastSent < targetIntervalMs)) {
+  const throttle = throttleChk.checked;
+  if (sending || (throttle && now - lastSent < TARGET_INTERVAL_MS)) {
     rafId = requestAnimationFrame(sendFrameLoop);
     return;
   }
-
   sending = true;
   lastSent = now;
 
-  const tmp = document.createElement('canvas');
-  tmp.width = video.videoWidth;
-  tmp.height = video.videoHeight;
-  tmp.getContext('2d').drawImage(video, 0, 0, tmp.width, tmp.height);
-  const dataUrl = tmp.toDataURL('image/jpeg', 0.6);
+  // Draw the current frame to a *small* canvas to reduce payload
+  tctx.drawImage(video, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+  const dataUrl = tmp.toDataURL('image/jpeg', 0.5); // compress further to reduce latency
 
   try {
     const res = await fetch('/predict_frame', {
@@ -142,45 +161,53 @@ async function sendFrameLoop() {
 
     if (!out.ok) {
       resultBox.textContent = `Server error: ${out.error || 'Unknown'}`;
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
     } else if (out.status === 'no_face') {
       resultBox.textContent = 'No face detected';
       ctx.clearRect(0, 0, overlay.width, overlay.height);
     } else {
       const { label, confidence, latency_ms, box } = out;
-      resultBox.textContent =
-        `Prediction: ${label} • Confidence: ${Math.round(confidence * 100)}% • Latency: ${latency_ms} ms`;
+
+      // Extra client-side guard: ignore tiny boxes (likely FP)
       if (box) {
-        const [x, y, w, h] = box;
-        drawBox(x, y, w, h, label, confidence);
+        const [bx, by, bw, bh] = box;
+        const boxArea = bw * bh;
+        const frameArea = CAPTURE_WIDTH * CAPTURE_HEIGHT;
+        const ratio = boxArea / frameArea;
+        if (ratio < MIN_BOX_AREA_RATIO) {
+          resultBox.textContent = 'No face detected';
+          ctx.clearRect(0, 0, overlay.width, overlay.height);
+        } else {
+          resultBox.textContent = `Prediction: ${label} • Confidence: ${Math.round(confidence * 100)}% • Latency: ${latency_ms} ms`;
+          drawBoxScaled(box, label, confidence);
+        }
       } else {
+        resultBox.textContent = `Prediction: ${label} • Confidence: ${Math.round(confidence * 100)}% • Latency: ${latency_ms} ms`;
         ctx.clearRect(0, 0, overlay.width, overlay.height);
       }
     }
-  } catch (_) {
+  } catch (e) {
     resultBox.textContent = 'Network error';
+    // Keep going; network can be transient
   } finally {
     sending = false;
     rafId = requestAnimationFrame(sendFrameLoop);
   }
 }
 
-function startSending() {
-  if (!rafId) rafId = requestAnimationFrame(sendFrameLoop);
-}
-function stopSending() {
-  if (rafId) cancelAnimationFrame(rafId);
-  rafId = null;
-  sending = false;
-}
-
+// Pause network work when tab not visible
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) stopSending(); else startSending();
+  if (document.hidden) {
+    stopSending();
+  } else if (stream) {
+    startSending();
+  }
 });
 
-// ---------- UI ----------
+// ----- UI wiring -----
 startBtn.addEventListener('click', async () => {
   try {
-    // Don’t repopulate here; that was overriding your selection
+    await listCameras();
     const selectedDeviceId = cameraSelect.value || undefined;
     await startCamera(selectedDeviceId);
     startBtn.disabled = true;
@@ -196,7 +223,7 @@ stopBtn.addEventListener('click', () => {
   stopBtn.disabled = true;
 });
 
-// Upload form
+// Upload form (unchanged)
 const uploadForm = document.getElementById('uploadForm');
 const uploadResult = document.getElementById('uploadResult');
 const uploadedPreview = document.getElementById('uploadedPreview');
@@ -225,15 +252,13 @@ uploadForm.addEventListener('submit', async (e) => {
       uploadResult.textContent = 'No face detected';
       return;
     }
-    uploadResult.textContent =
-      `Prediction: ${out.label} • Confidence: ${Math.round(out.confidence * 100)}% • Latency: ${out.latency_ms} ms`;
-  } catch (_) {
+    uploadResult.textContent = `Prediction: ${out.label} • Confidence: ${Math.round(out.confidence * 100)}% • Latency: ${out.latency_ms} ms`;
+  } catch (err) {
     uploadResult.textContent = 'Network error';
   }
 });
 
-// Initial setup: ask permission once, then populate the list
-(async () => {
-  await primePermissions();
-  await listCameras(false);
-})();
+// Ask permission once so labels populate on mobile, then list cams
+navigator.mediaDevices?.getUserMedia({ video: true, audio: false })
+  .then(() => listCameras())
+  .catch(() => listCameras());

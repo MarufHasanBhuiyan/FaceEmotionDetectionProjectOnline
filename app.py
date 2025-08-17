@@ -79,16 +79,7 @@ def fallback_center_crop(gray):
 def predict_from_gray_and_faces(gray):
     faces = detect_faces_robust(gray)
     if len(faces) == 0:
-        # Last resort: centered crop
-        inp = fallback_center_crop(gray)
-        if inp is None:
-            return None, None, None
-        t0 = time.time()
-        preds = MODEL.predict(inp, verbose=0)[0]
-        latency_ms = int((time.time() - t0) * 1000)
-        idx = int(np.argmax(preds))
-        conf = float(preds[idx])
-        return idx, conf, None  # no box
+         return None, None, None
     else:
         box = pick_largest_face(faces)
         inp = preprocess_face(gray, box)
