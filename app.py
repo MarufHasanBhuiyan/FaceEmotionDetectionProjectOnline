@@ -11,7 +11,6 @@ from tensorflow.keras.preprocessing.image import img_to_array
 
 # --------------------- Config ---------------------
 LABELS = ['angry','depression','disgust','fear','happy','neutral','sad','surprise']
-
 FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 MODEL = load_model('emotiondetector.h5')
 _ = MODEL.predict(np.zeros((1,48,48,1), dtype=np.float32))  # warmup
@@ -44,31 +43,30 @@ def pick_largest_face(faces):
 
 def detect_faces_robust(gray):
     """More tolerant detection with a second pass."""
-    # Equalize to help low-contrast grayscale photos
     gray_eq = cv2.equalizeHist(gray)
-
     faces = FACE_CASCADE.detectMultiScale(
-        gray_eq, scaleFactor=1.1, minNeighbors=3, minSize=(24, 24)
+        gray_eq,
+        scaleFactor=1.1,
+        minNeighbors=3,
+        minSize=(24, 24)
     )
     if len(faces) > 0:
         return faces
-
-    # Second pass: slightly different params; also try upscaled image for tiny faces
+    # Second pass: upscaled for tiny faces
     up = cv2.resize(gray_eq, None, fx=1.25, fy=1.25, interpolation=cv2.INTER_LINEAR)
     faces_up = FACE_CASCADE.detectMultiScale(
-        up, scaleFactor=1.07, minNeighbors=2, minSize=(24, 24)
+        up,
+        scaleFactor=1.07,
+        minNeighbors=2,
+        minSize=(24, 24)
     )
     if len(faces_up) > 0:
-        # Map boxes back to original coords
-        mapped = []
-        for (x, y, w, h) in faces_up:
-            mapped.append((int(x/1.25), int(y/1.25), int(w/1.25), int(h/1.25)))
+        mapped = [(int(x/1.25), int(y/1.25), int(w/1.25), int(h/1.25)) for (x,y,w,h) in faces_up]
         return np.array(mapped, dtype=np.int32)
-
     return np.array([])
 
 def fallback_center_crop(gray):
-    """As a last resort, take a centered square crop so we still return a prediction."""
+    """Centered square crop as last resort."""
     h, w = gray.shape[:2]
     side = min(h, w)
     x0 = (w - side) // 2
@@ -79,7 +77,15 @@ def fallback_center_crop(gray):
 def predict_from_gray_and_faces(gray):
     faces = detect_faces_robust(gray)
     if len(faces) == 0:
-         return None, None, None
+        inp = fallback_center_crop(gray)
+        if inp is None:
+            return None, None, None
+        t0 = time.time()
+        preds = MODEL.predict(inp, verbose=0)[0]
+        latency_ms = int((time.time() - t0) * 1000)
+        idx = int(np.argmax(preds))
+        conf = float(preds[idx])
+        return idx, conf, None  # no box
     else:
         box = pick_largest_face(faces)
         inp = preprocess_face(gray, box)
@@ -104,15 +110,12 @@ def predict_image():
     file = request.files['file']
     if file.filename == '':
         return jsonify({'ok': False, 'error': 'Empty filename'}), 400
-
     img = Image.open(file.stream).convert('RGB')
     frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     idx, conf, box = predict_from_gray_and_faces(gray)
     if idx is None:
         return jsonify({'ok': True, 'status': 'no_face'})
-
     resp = {
         'ok': True,
         'status': 'ok',
@@ -130,17 +133,13 @@ def predict_frame():
     data = request.get_json()
     if not data or 'image' not in data:
         return jsonify({'ok': False, 'error': 'Missing image'}), 400
-
     frame = decode_data_url_image(data['image'])
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     t0 = time.time()
     idx, conf, box = predict_from_gray_and_faces(gray)
     latency_ms = int((time.time() - t0) * 1000)
-
     if idx is None:
         return jsonify({'ok': True, 'status': 'no_face'})
-
     resp = {
         'ok': True,
         'status': 'ok',
